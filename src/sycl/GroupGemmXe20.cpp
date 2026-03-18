@@ -31,14 +31,20 @@ void Xe20MoEGEMMLauncher(
     const int gemm_k,
     const int* num_rows_per_expert_device,
     const int num_experts,
-    int* workspace) {
+    int* workspace,
+    float gemm1_alpha,
+    float gemm1_limit) {
   using Element = cutlass::bfloat16_t;
 
   auto make_dummy_tensor = [&](auto val, auto stride) {
     return make_tensor(make_gmem_ptr(&val), make_layout(repeat<rank_v<decltype(stride)>>(1), stride));
   };
   auto make_dummy_bias = [&](auto val) {
-    return make_tensor(make_gmem_ptr(&val), make_layout(Shape<int>{}, Stride<_1>{}));
+    if constexpr (FuseAct && ActType == 2) {  // SWIGLU interleaved: stride 2
+      return make_tensor(make_gmem_ptr(&val), make_layout(Shape<int>{}, Stride<_2>{}));
+    } else {
+      return make_tensor(make_gmem_ptr(&val), make_layout(Shape<int>{}, Stride<_1>{}));
+    }
   };
   using StrideA = Stride<int, _1>;
   using StrideB = Stride<int, _1>;
@@ -82,6 +88,8 @@ void Xe20MoEGEMMLauncher(
       num_experts,
       workspace,
       mma,
+      gemm1_alpha,
+      gemm1_limit,
   };
 
   auto event = q.submit([&](sycl::handler& h) {
@@ -107,7 +115,9 @@ void Xe20MoEGEMMLauncher(
       gemm_k,                                 \
       total_rows_for_experts.data_ptr<int>(), \
       n_experts,                              \
-      atomic_buffer.data_ptr<int>())
+      atomic_buffer.data_ptr<int>(),          \
+      gemm1_alpha,                            \
+      gemm1_limit)
 
 #define DISPATCH_MOE_HELPER_BIAS(ActType, FuseAct, WithBias, ...) \
   do {                                                            \
@@ -136,6 +146,9 @@ void Xe20MoEGEMMLauncher(
       case 1:                                                            \
         DISPATCH_MOE_HELPER_FUSE_ACT(1, FuseAct, WithBias, __VA_ARGS__); \
         break;                                                           \
+      case 2:                                                            \
+        DISPATCH_MOE_HELPER_FUSE_ACT(2, FuseAct, WithBias, __VA_ARGS__); \
+        break;                                                           \
       default:                                                           \
         TORCH_CHECK(false, "Unsupported activation type");               \
     }                                                                    \
@@ -151,8 +164,10 @@ void moe_grouped_mm_nt_xe20(
     const std::optional<at::Tensor>& bias,
     const torch::Tensor& total_rows_for_experts,
     const int64_t n_experts,
-    const int64_t activation_type,  // 0=silu, 1=gelu
-    bool fuse_act) {
+    const int64_t activation_type,  // 0=silu, 1=gelu, 2=swiglu
+    bool fuse_act,
+    double gemm1_alpha,
+    double gemm1_limit) {
   int total_m = activations.sizes()[0];
   int gemm_k = activations.sizes()[1];
   auto weights_shape = weights.sizes().vec();
